@@ -2,6 +2,7 @@ import argparse
 import json
 import logging
 import os
+import socket
 import sys
 from datetime import datetime, timezone, timedelta
 
@@ -293,7 +294,24 @@ def resolve_ip(ip):
     
     host_name = ip_mapping_cache.get(ip)
     if host_name:
+        if host_name == ip:
+            return ip
         return f"{host_name} ({ip})"
+        
+    try:
+        # 短いタイムアウトを設定して逆引きによる遅延を防ぐ
+        socket.setdefaulttimeout(1.0)
+        host_name, _, _ = socket.gethostbyaddr(ip)
+        ip_mapping_cache[ip] = host_name
+        with open(IP_HOST_FILE, "w") as f:
+            json.dump(ip_mapping_cache, f, indent=2)
+        return f"{host_name} ({ip})"
+    except (socket.herror, socket.gaierror, socket.timeout, OSError):
+        # 逆引き失敗時はIPそのものをキャッシュして再試行を防ぐ
+        ip_mapping_cache[ip] = ip
+        with open(IP_HOST_FILE, "w") as f:
+            json.dump(ip_mapping_cache, f, indent=2)
+            
     return ip
 
 def feature_a_threat_detection(client):
@@ -358,7 +376,14 @@ def feature_b_unknown_devices(client):
     payload = {
         "size": 0,
         "query": {
-            "range": {"@timestamp": {"gte": "now-1h"}}
+            "bool": {
+                "must": [
+                    {"range": {"@timestamp": {"gte": "now-1h"}}}
+                ],
+                "filter": [
+                    {"terms": {"network.direction": ["internal", "outbound"]}}
+                ]
+            }
         },
         "aggs": {
             "active_ips": {
@@ -402,7 +427,14 @@ def feature_c_daily_summary(client):
         },
         "aggs": {
             "total_bytes": {"sum": {"field": "network.bytes"}},
-            "active_devices": {"cardinality": {"field": "source.ip"}},
+            "active_devices": {
+                "filter": {
+                    "terms": {"network.direction": ["internal", "outbound"]}
+                },
+                "aggs": {
+                    "count": {"cardinality": {"field": "source.ip"}}
+                }
+            },
             "top_countries": {"terms": {"field": "destination.geo.country_iso_code", "size": 10}},
             "top_protocols": {"terms": {"field": "protocol", "size": 10}},
             "http_4xx": {"filter": {"range": {"http.response.status_code": {"gte": 400, "lt": 500}}}},
@@ -410,7 +442,8 @@ def feature_c_daily_summary(client):
             "top_talkers": {
                 "terms": {"field": "source.ip", "size": 50, "order": {"total_bytes": "desc"}},
                 "aggs": {
-                    "total_bytes": {"sum": {"field": "network.bytes"}}
+                    "total_bytes": {"sum": {"field": "network.bytes"}},
+                    "directions": {"terms": {"field": "network.direction", "size": 3}}
                 }
             }
         }
@@ -459,7 +492,7 @@ def feature_c_daily_summary(client):
     aggs = data.get("aggregations", {})
     
     total_bytes = aggs.get("total_bytes", {}).get("value", 0)
-    active_devices = aggs.get("active_devices", {}).get("value", 0)
+    active_devices = aggs.get("active_devices", {}).get("count", {}).get("value", 0)
     http_4xx = aggs.get("http_4xx", {}).get("doc_count", 0)
     http_5xx = aggs.get("http_5xx", {}).get("doc_count", 0)
     nx_count = nx_data.get("hits", {}).get("total", {}).get("value", 0)
@@ -511,7 +544,15 @@ def feature_c_daily_summary(client):
             ip = b["key"]
             bytes_t = b["total_bytes"]["value"]
             mb_t = bytes_t / (1024 * 1024)
-            text_lines.append(f"  - `{resolve_ip(ip)}` : {mb_t:.2f} MB")
+            gb_t = mb_t / 1024
+            
+            dirs = [d["key"] for d in b.get("directions", {}).get("buckets", [])]
+            dir_str = f" [{', '.join(dirs)}]" if dirs else ""
+            
+            if gb_t > 1:
+                text_lines.append(f"  - `{resolve_ip(ip)}`{dir_str} : {gb_t:.2f} GB")
+            else:
+                text_lines.append(f"  - `{resolve_ip(ip)}`{dir_str} : {mb_t:.2f} MB")
     else:
         text_lines.append("  - データなし")
         
