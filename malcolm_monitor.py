@@ -188,6 +188,9 @@ def update_dhcp_mapping(client):
                     {"range": {"@timestamp": {"gte": "now-24h"}}},
                     {"exists": {"field": "source.ip"}},
                     {"exists": {"field": "source.mac"}}
+                ],
+                "filter": [
+                    {"terms": {"network.direction": ["internal", "outbound"]}}
                 ]
             }
         },
@@ -282,7 +285,26 @@ def update_dhcp_mapping(client):
         
     logger.info(f"IP-to-Hostname mapping updated. Total entries: {len(ip_mapping_cache)}")
 
-def resolve_ip(ip):
+def resolve_external_ip_from_dns(client, ip):
+    payload = {
+        "size": 1,
+        "query": {
+            "bool": {
+                "must": [
+                    {"term": {"event.dataset": "dns"}},
+                    {"term": {"zeek.dns.answers": ip}}
+                ]
+            }
+        },
+        "sort": [{"@timestamp": {"order": "desc"}}],
+        "_source": ["zeek.dns.query"]
+    }
+    data = client.query("malcolm_*", payload)
+    if data and "hits" in data and data["hits"]["hits"]:
+        return data["hits"]["hits"][0]["_source"].get("zeek", {}).get("dns", {}).get("query")
+    return None
+
+def resolve_ip(ip, client=None, directions=None):
     global ip_mapping_cache
     if not ip_mapping_cache:
         if os.path.exists(IP_HOST_FILE):
@@ -298,6 +320,23 @@ def resolve_ip(ip):
             return ip
         return f"{host_name} ({ip})"
         
+    # 外部IP（internalとoutboundが含まれない）の場合の分岐
+    if directions is not None and "internal" not in directions and "outbound" not in directions:
+        if client:
+            dns_name = resolve_external_ip_from_dns(client, ip)
+            if dns_name:
+                logger.info(f"Resolved external IP {ip} to DNS name: {dns_name}")
+                ip_mapping_cache[ip] = dns_name
+                with open(IP_HOST_FILE, "w") as f:
+                    json.dump(ip_mapping_cache, f, indent=2)
+                return f"{dns_name} ({ip})"
+        
+        # 名前が見つからない場合はIPアドレスのみを返し、次回以降も逆引きしないようにキャッシュする
+        ip_mapping_cache[ip] = ip
+        with open(IP_HOST_FILE, "w") as f:
+            json.dump(ip_mapping_cache, f, indent=2)
+        return ip
+
     try:
         # 短いタイムアウトを設定して逆引きによる遅延を防ぐ
         socket.setdefaulttimeout(1.0)
@@ -347,7 +386,7 @@ def feature_a_threat_detection(client):
         dest_ip = source.get("destination", {}).get("ip", "Unknown")
         rule_name = source.get("suricata", {}).get("eve", {}).get("alert", {}).get("signature", "Unknown Rule")
         
-        key = f"{resolve_ip(src_ip)} -> {resolve_ip(dest_ip)} : {rule_name}"
+        key = f"{resolve_ip(src_ip, client=client)} -> {resolve_ip(dest_ip, client=client)} : {rule_name}"
         alerts_summary[key] = alerts_summary.get(key, 0) + 1
         
     # 通知の組み立て
@@ -412,7 +451,7 @@ def feature_b_unknown_devices(client):
         save_known_devices(known_devices)
         text = "*【新規デバイス検知】*\nネットワーク上で未知のIPアドレスを検知しました:\n"
         for ip in new_devices:
-            text += f"- `{resolve_ip(ip)}`\n"
+            text += f"- `{resolve_ip(ip, client=client)}`\n"
         send_webhook(text)
     else:
         logger.info("No new devices found.")
@@ -549,10 +588,11 @@ def feature_c_daily_summary(client):
             dirs = [d["key"] for d in b.get("directions", {}).get("buckets", [])]
             dir_str = f" [{', '.join(dirs)}]" if dirs else ""
             
+            resolved_name = resolve_ip(ip, client=client, directions=dirs)
             if gb_t > 1:
-                text_lines.append(f"  - `{resolve_ip(ip)}`{dir_str} : {gb_t:.2f} GB")
+                text_lines.append(f"  - `{resolved_name}`{dir_str} : {gb_t:.2f} GB")
             else:
-                text_lines.append(f"  - `{resolve_ip(ip)}`{dir_str} : {mb_t:.2f} MB")
+                text_lines.append(f"  - `{resolved_name}`{dir_str} : {mb_t:.2f} MB")
     else:
         text_lines.append("  - データなし")
         
